@@ -4,9 +4,9 @@
 
 Works with stimulators, medical items, skill effects, bleedings, fractures, and every other health effect the game tracks.
 
-![MedEffectsHUD screenshot](https://i.imgur.com/PLACEHOLDER.png)
-<!-- Replace the link above with an actual screenshot before publishing -->
+![MedEffectsHUD screenshot](https://i.postimg.cc/6qgGztFY/Screenshot.png)
 
+5
 ---
 
 ## Features
