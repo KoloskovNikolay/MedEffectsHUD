@@ -25,7 +25,7 @@ namespace MedEffectsHUD
     {
         public const string PluginGuid    = "com.koloskovnick.medeffectshud";
         public const string PluginName    = "MedEffectsHUD";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.0.1";
 
         internal static ManualLogSource Log;
 
@@ -99,11 +99,16 @@ namespace MedEffectsHUD
         private readonly HashSet<int> _containerIds = new HashSet<int>();
         private readonly List<object> _containers = new List<object>();
 
+        // WholeTime offset for buff reapplication.
+        // When a buff is re-applied (same object reused), WholeTime doesn't reset.
+        // We record WholeTime at the moment of reapplication so we can compute:
+        //   remaining = Duration - (WholeTime - offset)
+        // Key = identity hash of the buff object.
+        private readonly Dictionary<int, float> _buffWholeTimeOffset =
+            new Dictionary<int, float>();
+
         // Deep scan done flag
         private bool _deepScanDone;
-
-        // One-shot time diagnostics: fires once when we have actual buffs
-        private bool _timeDiagDone;
 
         // Display
         private readonly List<DisplayEffect> _positiveEffects = new List<DisplayEffect>();
@@ -287,7 +292,6 @@ namespace MedEffectsHUD
                     _cachedHC = _healthController;
                     _eventsSubscribed = false;
                     _deepScanDone     = false;
-                    _timeDiagDone     = false;
                     _capturedBuffs.Clear();
                     _buffToContainer.Clear();
                     _containerIds.Clear();
@@ -301,11 +305,12 @@ namespace MedEffectsHUD
         private void DoReset()
         {
             _localPlayer = null; _healthController = null;
-            _eventsSubscribed = false; _deepScanDone = false; _timeDiagDone = false;
+            _eventsSubscribed = false; _deepScanDone = false;
             _capturedBuffs.Clear();
             _buffToContainer.Clear();
             _containerIds.Clear();
             _containers.Clear();
+            _buffWholeTimeOffset.Clear();
         }
 
         // ================================================================
@@ -421,24 +426,61 @@ namespace MedEffectsHUD
             {
                 string key = GetBuffKey(buff);
                 if (string.IsNullOrEmpty(key)) return;
+
+                // When a buff is re-applied (e.g. using another stim), the game creates
+                // a new buff object. Remove old entries with the same BuffName + BodyPart
+                // so that stale timer data from the old object doesn't contaminate display.
+                string buffName = GetStringProp(buff, "BuffName");
+                string bodyPart = GetStringProp(buff, "BodyPart");
+                if (!string.IsNullOrEmpty(buffName))
+                {
+                    var staleKeys = new List<string>();
+                    foreach (var kv in _capturedBuffs)
+                    {
+                        if (ReferenceEquals(kv.Value, buff)) continue;
+                        string existingName = GetStringProp(kv.Value, "BuffName");
+                        string existingPart = GetStringProp(kv.Value, "BodyPart");
+                        if (existingName == buffName && existingPart == bodyPart)
+                            staleKeys.Add(kv.Key);
+                    }
+                    foreach (var sk in staleKeys)
+                    {
+                        _capturedBuffs.Remove(sk);
+                        // Also clean up container mapping for the stale buff
+                        Log.LogInfo($"[S1+] Removed stale buff on reapply: {sk}");
+                    }
+                }
+
                 _capturedBuffs[key] = buff;
                 if (_tick < 100)
                     Log.LogInfo($"[S1+] Buff ADDED: {key}");
+
+                // Record current WholeTime as the reapplication offset.
+                // On first application WholeTime is ~1s (close to 0), which is fine.
+                // On reapplication WholeTime will be e.g. 23.9 — we store this so
+                // GetBuffTimeLeft computes: Duration - (WholeTime - 23.9) = correct remaining.
+                int bid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(buff);
+                float currentWholeTime = GetFloatProp(buff, "WholeTime");
+                _buffWholeTimeOffset[bid] = currentWholeTime;
             }
             catch { }
         }
 
         internal void OnBuffRemovedObj(object buff)
         {
-            // We intentionally keep references here and prune via the Active
-            // property during RefreshEffects, because add/remove events fire
-            // in quick succession.
             try
             {
+                string key = GetBuffKey(buff);
                 if (_tick < 100)
+                    Log.LogInfo($"[S1~] Buff REMOVE event: {key}");
+                if (!string.IsNullOrEmpty(key) && _capturedBuffs.ContainsKey(key))
                 {
-                    string key = GetBuffKey(buff);
-                    Log.LogInfo($"[S1~] Buff notif (Action_1): {key}");
+                    bool active = GetBoolProp(buff, "Active", false);
+                    if (!active)
+                    {
+                        _capturedBuffs.Remove(key);
+                        Log.LogInfo($"[S1~] Buff removed (inactive): {key}");
+                    }
                 }
             }
             catch { }
@@ -604,35 +646,55 @@ namespace MedEffectsHUD
             return 1;
         }
 
-        /// <summary>Get the remaining time for a buff (tries Duration−Elapsed, container, direct).</summary>
+        /// <summary>Get the remaining time for a buff.
+        /// Collects ALL available time sources and returns the MAXIMUM.
+        /// This is critical for reapplication: when a stim is re-used, the container's
+        /// TimeLeft is reset to full duration, but the buff's WholeTime keeps ticking
+        /// from the original application. Taking the max ensures we show the correct
+        /// (reset) timer instead of the stale computed value.</summary>
         private float GetBuffTimeLeft(object buff)
         {
-            // 1) Try computing from Settings.Duration - WholeTime (Class2222 buffs from stimulators)
+            float bestTime = -1f;
+
             float duration = GetSettingsDuration(buff);
+            float elapsed = -1f;
+            float computedRemaining = -1f;
+            float containerTL = -1f;
+            float directTL = -1f;
+            int bid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(buff);
+
+            // 1) Try computing from Settings.Duration - (WholeTime - offset)
             if (duration > 0)
             {
-                float elapsed = GetFloatProp(buff, "WholeTime");
+                elapsed = GetFloatProp(buff, "WholeTime");
                 if (elapsed >= 0)
                 {
-                    float remaining = duration - elapsed;
-                    if (remaining > 0 && remaining < 100000f) return remaining;
-                    if (remaining <= 0) return 0f; // expired
+                    // Subtract the offset recorded at (re)application time
+                    float offset = 0f;
+                    if (_buffWholeTimeOffset.TryGetValue(bid, out float off))
+                        offset = off;
+                    float adjustedElapsed = elapsed - offset;
+                    if (adjustedElapsed < 0) adjustedElapsed = 0;
+                    computedRemaining = duration - adjustedElapsed;
+                    if (computedRemaining > 0 && computedRemaining < 100000f)
+                        bestTime = computedRemaining;
                 }
             }
 
             // 2) Try parent container's TimeLeft (GClass3056)
-            int bid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(buff);
             if (_buffToContainer.TryGetValue(bid, out object container))
             {
-                float tl = GetFloatProp(container, "TimeLeft");
-                if (tl > 0 && tl < 100000f) return tl;
+                containerTL = GetFloatProp(container, "TimeLeft");
+                if (containerTL > 0 && containerTL < 100000f && containerTL > bestTime)
+                    bestTime = containerTL;
             }
 
             // 3) Try buff's own TimeLeft
-            float directTL = GetFloatProp(buff, "TimeLeft");
-            if (directTL > 0 && directTL < 100000f) return directTL;
+            directTL = GetFloatProp(buff, "TimeLeft");
+            if (directTL > 0 && directTL < 100000f && directTL > bestTime)
+                bestTime = directTL;
 
-            return -1f;
+            return bestTime;
         }
 
         /// <summary>Read Duration from buff's Settings object.</summary>
@@ -773,16 +835,6 @@ namespace MedEffectsHUD
                     float value    = GetFloatProp(buff, "Value");
                     float timeLeft = SanitizeTimer(GetBuffTimeLeft(buff));
 
-                    // One-time diagnostic: verify remaining time calculation
-                    if (!_timeDiagDone)
-                    {
-                        float wt = GetFloatProp(buff, "WholeTime");
-                        float dur = GetSettingsDuration(buff);
-                        Log.LogInfo($"[TIME] {StripColorTags(buffName).Substring(0, Math.Min(25, StripColorTags(buffName).Length))}: " +
-                            $"Duration={dur:F1} WholeTime(elapsed)={wt:F2} " +
-                            $"remaining={timeLeft:F1}");
-                    }
-
                     // Determine positive/negative from the color tag (#C40000 = red = neg)
                     bool isNegBuff = buffName.Contains("#C40000");
 
@@ -813,14 +865,11 @@ namespace MedEffectsHUD
                 }
                 catch { }
             }
-            // Mark time diag as done if we logged at least one buff
-            if (!_timeDiagDone && buffCount > 0)
-            {
-                _timeDiagDone = true;
-                Log.LogInfo($"[TIME_DIAG] Done. Buff timer uses Settings.Duration - WholeTime.");
-            }
-
             foreach (var dk in deadKeys) _capturedBuffs.Remove(dk);
+
+            // ---- Stale buff detection: remove duplicates where an older object
+            //      for the same logical buff has a frozen/lower timer than a newer one ----
+            PruneStaleDuplicateBuffs();
 
             // ---- Health effects from GetAllEffects() ----
             int fxCount = ReadHealthEffects(seenPos, seenNeg);
@@ -836,6 +885,72 @@ namespace MedEffectsHUD
                 Log.LogDebug($"[Refresh] buffs={buffCount} fx={fxCount} " +
                              $"pos={_positiveEffects.Count} neg={_negativeEffects.Count} " +
                              $"captured={_capturedBuffs.Count}");
+        }
+
+        /// <summary>
+        /// Remove stale duplicate buff objects from _capturedBuffs.
+        /// </summary>
+        private void PruneStaleDuplicateBuffs()
+        {
+            // Only run every 4 ticks (~2 seconds) to avoid overhead
+            if (_tick % 4 != 0) return;
+
+            try
+            {
+                // Group buffs by their logical identity (BuffName + BodyPart + Value)
+                // Buffs with different Values are considered distinct and allowed to coexist.
+                var groups = new Dictionary<string, List<KeyValuePair<string, object>>>(
+                    StringComparer.OrdinalIgnoreCase);
+
+                foreach (var kv in _capturedBuffs)
+                {
+                    string buffName = GetStringProp(kv.Value, "BuffName");
+                    string bodyPart = GetStringProp(kv.Value, "BodyPart");
+                    float value = GetFloatProp(kv.Value, "Value");
+                    if (string.IsNullOrEmpty(buffName)) continue;
+
+                    string logicalKey = buffName + "|" + (bodyPart ?? "") + "|" + value.ToString("F2");
+                    if (!groups.ContainsKey(logicalKey))
+                        groups[logicalKey] = new List<KeyValuePair<string, object>>();
+                    groups[logicalKey].Add(kv);
+                }
+
+                var toRemove = new List<string>();
+
+                foreach (var group in groups)
+                {
+                    if (group.Value.Count <= 1) continue;
+
+                    // Find the entry with the highest remaining time (freshest buff)
+                    string bestKey = null;
+                    float bestTime = -1f;
+
+                    foreach (var entry in group.Value)
+                    {
+                        float t = GetBuffTimeLeft(entry.Value);
+                        if (t > bestTime)
+                        {
+                            bestTime = t;
+                            bestKey = entry.Key;
+                        }
+                    }
+
+                    // Mark all others for removal
+                    foreach (var entry in group.Value)
+                    {
+                        if (entry.Key != bestKey)
+                        {
+                            toRemove.Add(entry.Key);
+                            Log.LogInfo($"[Prune] Removing stale duplicate: {StripColorTags(GetStringProp(entry.Value, "BuffName") ?? "?")} " +
+                                $"(time={GetBuffTimeLeft(entry.Value):F0}s, keeping={bestTime:F0}s)");
+                        }
+                    }
+                }
+
+                foreach (var key in toRemove)
+                    _capturedBuffs.Remove(key);
+            }
+            catch { }
         }
 
         /// <summary>Periodic quick re-scan of known container fields.</summary>
@@ -952,17 +1067,6 @@ namespace MedEffectsHUD
                     var entry = ExtractEffectEntry(fx);
                     if (entry == null) continue;
                     if (IsUselessEffect(entry.EffectTypeName)) continue;
-
-                    // Diagnostic: log all time properties from health effects (fires once)
-                    if (!_timeDiagDone)
-                    {
-                        float rawTL = GetFloatProp(fx, "TimeLeft");
-                        float rawWT = GetFloatProp(fx, "WorkTime");
-                        float rawStr = GetFloatProp(fx, "Strength");
-                        Log.LogInfo($"[FX_TIME] {entry.EffectTypeName}: " +
-                            $"TimeLeft={rawTL:F1} WorkTime={rawWT:F1} " +
-                            $"Strength={rawStr:F2} isPos={entry.IsPositive}");
-                    }
 
                     string display = GetLocalizedEffectName(entry.EffectTypeName);
                     display = StripValueFromName(display);
@@ -1401,9 +1505,23 @@ namespace MedEffectsHUD
             var ex = list.Find(e => e.Name == de.Name);
             if (ex != null)
             {
-                // Keep the longest remaining time
-                if (de.Time > ex.Time) ex.Time = de.Time;
-                if (de.Strength != 0 && ex.Strength == 0) ex.Strength = de.Strength;
+                // If the strength (value) is different, allow both entries as separate lines.
+                // E.g. two different stims give "Переносимый вес (+80)" and "Переносимый вес (+30)".
+                bool sameStrength = Math.Abs(ex.Strength - de.Strength) < 0.001f
+                                 || (ex.Strength == 0f && de.Strength == 0f);
+                if (!sameStrength && de.Strength != 0f && ex.Strength != 0f)
+                {
+                    // Different value — add as a separate entry
+                    seen.Add(key);
+                    list.Add(de);
+                    return;
+                }
+
+                // Same value (or one is unknown) — merge, keeping the longest remaining time
+                if (de.Time > 0 && (ex.Time <= 0 || de.Time > ex.Time))
+                    ex.Time = de.Time;
+                if (de.Strength != 0f)
+                    ex.Strength = de.Strength;
                 seen.Add(key);
                 return;
             }
