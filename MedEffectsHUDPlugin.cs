@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
@@ -25,14 +26,14 @@ namespace MedEffectsHUD
     {
         public const string PluginGuid    = "com.koloskovnick.medeffectshud";
         public const string PluginName    = "MedEffectsHUD";
-        public const string PluginVersion = "1.0.1";
+        public const string PluginVersion = "1.1.0";
 
         internal static ManualLogSource Log;
 
         // Config — General
         private ConfigEntry<KeyboardShortcut> _toggleKey;
         // Config — Position
-        private ConfigEntry<float> _hudX, _hudY, _hudWidth;
+        private ConfigEntry<float> _hudX, _hudY, _hudWidth, _hudHeight;
         // Config — Appearance
         private ConfigEntry<int>   _fontSize;
         private ConfigEntry<float> _backgroundAlpha;
@@ -61,6 +62,18 @@ namespace MedEffectsHUD
         private ConfigEntry<string> _effectColorOverrides;
         private Dictionary<string, string> _colorOverrideMap =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Config — Font
+        private ConfigEntry<string> _fontName;
+        private ConfigEntry<bool>   _useGameFont;
+        // Config — Icons
+        private ConfigEntry<IconDisplayMode> _iconDisplayMode;
+        private ConfigEntry<int>   _iconSize;
+        // Config — Notifications
+        private ConfigEntry<bool>  _notifyBuffExpiring;
+        private ConfigEntry<bool>  _notifyDebuffReceived;
+        private ConfigEntry<float> _notifyDuration;
+        private ConfigEntry<int>   _notifyIconSize;
+        private ConfigEntry<float> _notifyPositionY;
         // Config — Blink
         private ConfigEntry<bool>  _blinkEnabled;
         private ConfigEntry<float> _blinkThreshold;
@@ -68,6 +81,17 @@ namespace MedEffectsHUD
 
         /// <summary>Time display format.</summary>
         public enum TimeFormat { Auto, SecondsOnly, MinutesOnly }
+
+        /// <summary>How icons and text are displayed.</summary>
+        public enum IconDisplayMode
+        {
+            /// <summary>Show only text labels (no icons).</summary>
+            TextOnly,
+            /// <summary>Show icons next to text labels.</summary>
+            IconAndText,
+            /// <summary>Show only icons in a compact grid.</summary>
+            IconOnly
+        }
 
         /// <summary>How to arrange positive and negative columns.</summary>
         public enum EffectLayout
@@ -122,6 +146,24 @@ namespace MedEffectsHUD
         private GUIStyle _posStyle, _negStyle, _dimStyle, _sepStyle;
         private bool _stylesInit;
 
+        // Icons
+        private string _iconsFolder;
+        private string _iconsPositiveFolder;
+        private string _iconsNegativeFolder;
+        private readonly Dictionary<string, Texture2D> _iconCache =
+            new Dictionary<string, Texture2D>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _iconMissing =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Center-screen notifications
+        private float _notifyExpireEndTime;   // Time.unscaledTime when expiring buff notification hides
+        private string _notifyExpireEffectId; // EffectId of the expiring buff to show
+        private float _notifyDebuffEndTime;   // Time.unscaledTime when debuff notification hides
+        private string _notifyDebuffEffectId; // EffectId of the received debuff to show
+        private readonly HashSet<string> _prevNegativeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _notifiedExpiring = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private GUIStyle _notifyTimerStyle;
+
         // ================================================================
         //  LIFECYCLE
         // ================================================================
@@ -134,9 +176,18 @@ namespace MedEffectsHUD
             _hudX            = Config.Bind("Position", "X", 10f);
             _hudY            = Config.Bind("Position", "Y", 200f);
             _hudWidth        = Config.Bind("Position", "Width", 560f);
+            _hudHeight       = Config.Bind("Position", "Height", 0f,
+                new ConfigDescription("HUD box height. Set to 0 for auto-calculation."));
             _fontSize        = Config.Bind("Appearance", "Font Size", 13);
             _backgroundAlpha = Config.Bind("Appearance", "Background Alpha", 0.85f,
                 new ConfigDescription("", new AcceptableValueRange<float>(0f, 1f)));
+            _fontName = Config.Bind("Appearance", "Font Name", "Arial",
+                new ConfigDescription(
+                    "OS font to use for the HUD. Ignored when Use Game Font is enabled.",
+                    new AcceptableValueList<string>(GetAvailableFonts())));
+            _useGameFont = Config.Bind("Appearance", "Use Game Font", false,
+                "Use the game's built-in font for a more immersive look.\n"
+                + "Overrides Font Name setting when enabled.");
             // Display
             _timeFormat  = Config.Bind("Display", "Time Format", TimeFormat.Auto,
                 "Auto = Xm XXs when ≥60s else Xs. SecondsOnly = always Xs. MinutesOnly = always Xm XXs.");
@@ -196,7 +247,56 @@ namespace MedEffectsHUD
             _blinkSpeed     = Config.Bind("Blink", "Speed", 3f,
                 new ConfigDescription("Blink frequency in Hz.",
                     new AcceptableValueRange<float>(0.5f, 10f)));
+            // Icons
+            _iconDisplayMode = Config.Bind("Icons", "Display Mode", IconDisplayMode.TextOnly,
+                "TextOnly = no icons, just text.\n"
+                + "IconAndText = show icon next to text.\n"
+                + "IconOnly = compact icon grid with timer underneath.");
+            _iconSize = Config.Bind("Icons", "Size", 32,
+                new ConfigDescription("Icon size in pixels.",
+                    new AcceptableValueRange<int>(8, 64)));
+            // Notifications
+            _notifyBuffExpiring = Config.Bind("Notifications", "Show Expiring Buff", true,
+                "Flash an icon at screen center when a buff is about to expire.");
+            _notifyDebuffReceived = Config.Bind("Notifications", "Show New Debuff", true,
+                "Flash an icon at screen center when a new debuff is received.");
+            _notifyDuration = Config.Bind("Notifications", "Duration", 1.5f,
+                new ConfigDescription("How long (seconds) the center notification stays visible.",
+                    new AcceptableValueRange<float>(0.5f, 5f)));
+            _notifyIconSize = Config.Bind("Notifications", "Icon Size", 64,
+                new ConfigDescription("Size of the center notification icon in pixels.",
+                    new AcceptableValueRange<int>(32, 256)));
+            _notifyPositionY = Config.Bind("Notifications", "Position Y", 0.35f,
+                new ConfigDescription("Vertical position of notification (0 = top, 1 = bottom).",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            // Resolve icons folder — support DLL in plugins root or in plugins/MedEffectsHUD/
+            string dllDir = Path.GetDirectoryName(Info.Location);
+            string candidate1 = Path.Combine(dllDir, "MedEffectsHUD", "icons"); // DLL in plugins root
+            string candidate2 = Path.Combine(dllDir, "icons");                  // DLL in plugins/MedEffectsHUD/
+            _iconsFolder = Directory.Exists(candidate1) ? candidate1
+                         : Directory.Exists(candidate2) ? candidate2
+                         : candidate1; // default
+            _iconsPositiveFolder = Path.Combine(_iconsFolder, "positive");
+            _iconsNegativeFolder = Path.Combine(_iconsFolder, "negative");
+            Log.LogInfo($"[Icons] DLL location: {Info.Location}");
+            Log.LogInfo($"[Icons] Icons folder: {_iconsFolder} (exists={Directory.Exists(_iconsFolder)})");
             Log.LogInfo($"{PluginName} v{PluginVersion} loaded!");
+        }
+
+        /// <summary>Get sorted list of OS-installed font names for the config dropdown.</summary>
+        private static string[] GetAvailableFonts()
+        {
+            try
+            {
+                var fonts = Font.GetOSInstalledFontNames();
+                if (fonts != null && fonts.Length > 0)
+                {
+                    Array.Sort(fonts, StringComparer.OrdinalIgnoreCase);
+                    return fonts;
+                }
+            }
+            catch { }
+            return new[] { "Arial", "Consolas", "Courier New", "Segoe UI", "Tahoma", "Verdana" };
         }
 
         /// <summary>Rebuild the blacklist HashSet from the config string.</summary>
@@ -311,6 +411,12 @@ namespace MedEffectsHUD
             _containerIds.Clear();
             _containers.Clear();
             _buffWholeTimeOffset.Clear();
+            _iconMissing.Clear();
+            _prevNegativeIds.Clear();
+            _notifiedExpiring.Clear();
+            _notifyExpireEndTime = 0;
+            _notifyDebuffEndTime = 0;
+            _notifyTimerStyle = null;
         }
 
         // ================================================================
@@ -452,8 +558,7 @@ namespace MedEffectsHUD
                 }
 
                 _capturedBuffs[key] = buff;
-                if (_tick < 100)
-                    Log.LogInfo($"[S1+] Buff ADDED: {key}");
+                Log.LogInfo($"[S1+] Buff ADDED: {key} (EffectId={GetBuffEffectId(buff)})");
 
                 // Record current WholeTime as the reapplication offset.
                 // On first application WholeTime is ~1s (close to 0), which is fine.
@@ -849,12 +954,16 @@ namespace MedEffectsHUD
                     // Override sign from color tag
                     if (isNegBuff && value > 0) value = -value;
 
+                    // If no red color tag but value is negative, treat as debuff
+                    if (!isNegBuff && value < 0) isNegBuff = true;
+
                     // Skip blacklisted effects
                     if (IsBlacklisted(display)) continue;
 
                     string ukey = display + "|" + (isNegBuff ? "N" : "P");
 
-                    var de = new DisplayEffect { Name = display, Time = timeLeft, Strength = value };
+                    var de = new DisplayEffect { Name = display, Time = timeLeft, Strength = value,
+                        EffectId = GetBuffEffectId(buff) };
 
                     if (!isNegBuff)
                         AddDedup(_positiveEffects, seenPos, de, ukey);
@@ -880,6 +989,9 @@ namespace MedEffectsHUD
                 _positiveEffects.Sort(CompareByTime);
                 _negativeEffects.Sort(CompareByTime);
             }
+
+            // ---- Center-screen notifications ----
+            UpdateNotifications();
 
             if (_tick % 20 == 1)
                 Log.LogDebug($"[Refresh] buffs={buffCount} fx={fxCount} " +
@@ -951,6 +1063,61 @@ namespace MedEffectsHUD
                     _capturedBuffs.Remove(key);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Check for notification triggers:
+        /// 1. Positive buff about to expire (time crosses blink threshold) — show once per buff.
+        /// 2. New negative effect appeared that wasn't there before — show once.
+        /// </summary>
+        private void UpdateNotifications()
+        {
+            float now = Time.unscaledTime;
+            float threshold = _blinkThreshold.Value > 0 ? _blinkThreshold.Value : 10f;
+
+            // 1. Expiring buff notification
+            if (_notifyBuffExpiring.Value)
+            {
+                foreach (var de in _positiveEffects)
+                {
+                    if (de.Time > 0 && de.Time <= threshold
+                        && !string.IsNullOrEmpty(de.EffectId)
+                        && !_notifiedExpiring.Contains(de.EffectId))
+                    {
+                        _notifiedExpiring.Add(de.EffectId);
+                        _notifyExpireEffectId = de.EffectId;
+                        _notifyExpireEndTime = now + _notifyDuration.Value;
+                        break; // one at a time
+                    }
+                }
+                // Clean up tracking for buffs no longer present
+                var currentPosIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var de in _positiveEffects)
+                    if (!string.IsNullOrEmpty(de.EffectId)) currentPosIds.Add(de.EffectId);
+                _notifiedExpiring.RemoveWhere(id => !currentPosIds.Contains(id));
+            }
+
+            // 2. New debuff notification
+            if (_notifyDebuffReceived.Value)
+            {
+                var currentNegIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var de in _negativeEffects)
+                    if (!string.IsNullOrEmpty(de.EffectId)) currentNegIds.Add(de.EffectId);
+
+                foreach (var id in currentNegIds)
+                {
+                    if (!_prevNegativeIds.Contains(id))
+                    {
+                        _notifyDebuffEffectId = id;
+                        _notifyDebuffEndTime = now + _notifyDuration.Value;
+                        break; // one at a time
+                    }
+                }
+
+                _prevNegativeIds.Clear();
+                foreach (var id in currentNegIds)
+                    _prevNegativeIds.Add(id);
+            }
         }
 
         /// <summary>Periodic quick re-scan of known container fields.</summary>
@@ -1079,7 +1246,8 @@ namespace MedEffectsHUD
                     {
                         Name     = display,
                         Time     = time,
-                        Strength = entry.Strength
+                        Strength = entry.Strength,
+                        EffectId = entry.EffectTypeName
                     };
                     if (entry.IsPositive)
                         AddDedup(_positiveEffects, seenPos, de, display);
@@ -1125,6 +1293,182 @@ namespace MedEffectsHUD
                 return $"{name}|{bodyPart}|{(value >= 0 ? "+" : "-")}|{hash}";
             }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// Extract a locale-independent effect identifier from an IPlayerBuff object.
+        /// Tries Settings.Name, TemplateId, Id, then falls back to the buff type name.
+        /// Used for icon file mapping so the same icon works across all localizations.
+        /// </summary>
+        private string GetBuffEffectId(object buff)
+        {
+            try
+            {
+                // Try to read Settings sub-object for a stable name/id
+                var settings = GetSubObject(buff, "Settings");
+                string settingsName = null;
+                if (settings != null)
+                {
+                    settingsName = GetStringProp(settings, "Name");
+
+                    // Log all Settings properties once per buff type to aid debugging
+                    LogSettingsOnce(settings, settingsName);
+
+                    // If Settings.Name is too generic (SkillRate, HealthRate, etc.),
+                    // try to find a more specific identifier
+                    if (!string.IsNullOrEmpty(settingsName) && !IsGenericEffectName(settingsName))
+                        return settingsName;
+
+                    string sId = GetStringProp(settings, "Id");
+                    if (!string.IsNullOrEmpty(sId) && !IsGenericEffectName(sId)) return sId;
+                    string sType = GetStringProp(settings, "EffectType");
+                    if (!string.IsNullOrEmpty(sType) && !IsGenericEffectName(sType)) return sType;
+                    string sBuffType = GetStringProp(settings, "BuffType");
+                    if (!string.IsNullOrEmpty(sBuffType) && !IsGenericEffectName(sBuffType)) return sBuffType;
+
+                    // For SkillRate buffs, try to find the skill name from Settings sub-properties
+                    if (settingsName == "SkillRate" && settings != null)
+                    {
+                        string skillName = TryExtractSkillName(settings);
+                        if (!string.IsNullOrEmpty(skillName))
+                            return "Skill_" + skillName;
+                    }
+
+                    // Try Settings.BuffName — often contains a clean English name
+                    // even when Settings.Name is empty (e.g. "Attention", "Health regeneration")
+                    string settingsBuffName = GetStringProp(settings, "BuffName");
+                    if (!string.IsNullOrEmpty(settingsBuffName))
+                    {
+                        string cleanBN = StripColorTags(settingsBuffName);
+                        cleanBN = StripValueFromName(cleanBN).Trim();
+                        if (!string.IsNullOrEmpty(cleanBN))
+                            return cleanBN;
+                    }
+                }
+
+                // Try top-level properties
+                string tid = GetStringProp(buff, "TemplateId");
+                if (!string.IsNullOrEmpty(tid)) return tid;
+                string id = GetStringProp(buff, "Id");
+                if (!string.IsNullOrEmpty(id)) return id;
+
+                // Fallback: use the cleaned BuffName to derive a usable EffectId
+                string buffName = GetStringProp(buff, "BuffName");
+                if (!string.IsNullOrEmpty(buffName))
+                {
+                    string clean = StripColorTags(buffName);
+                    clean = StripValueFromName(clean).Trim();
+                    if (!string.IsNullOrEmpty(clean))
+                        return clean; // localized name as last resort
+                }
+
+                // Last resort: generic Settings.Name (HealthRate, SkillRate, etc.)
+                if (!string.IsNullOrEmpty(settingsName))
+                    return settingsName;
+
+                return GetCleanEffectName(buff.GetType());
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Check if an effect name is too generic to use as an icon key.</summary>
+        private static bool IsGenericEffectName(string name)
+        {
+            switch (name)
+            {
+                case "SkillRate":
+                case "HealthRate":
+                case "EnergyRate":
+                case "HydrationRate":
+                case "StaminaRate":
+                case "BodyTemperature":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Try to extract a specific skill name from SkillRate Settings object.</summary>
+        private string TryExtractSkillName(object settings)
+        {
+            try
+            {
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                var type = settings.GetType();
+                // Look for SkillType, Skill, SkillName properties
+                foreach (string propName in new[] { "SkillType", "Skill", "SkillName", "SkillId" })
+                {
+                    var p = type.GetProperty(propName, flags);
+                    if (p != null)
+                    {
+                        var val = p.GetValue(settings);
+                        if (val != null)
+                        {
+                            string s = val.ToString();
+                            if (!string.IsNullOrEmpty(s)) return s;
+                        }
+                    }
+                    var f = type.GetField(propName, flags);
+                    if (f != null)
+                    {
+                        var val = f.GetValue(settings);
+                        if (val != null)
+                        {
+                            string s = val.ToString();
+                            if (!string.IsNullOrEmpty(s)) return s;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private readonly HashSet<string> _loggedSettingsTypes = new HashSet<string>();
+
+        /// <summary>Log all properties of a Settings object once per type for debugging.</summary>
+        private void LogSettingsOnce(object settings, string name)
+        {
+            if (settings == null) return;
+            // Include BuffName in key so we get dumps for different buffs sharing the same type
+            string buffNameForKey = GetStringProp(settings, "BuffName") ?? "";
+            string key = settings.GetType().Name + "|" + (name ?? "") + "|" + buffNameForKey;
+            if (_loggedSettingsTypes.Contains(key)) return;
+            _loggedSettingsTypes.Add(key);
+            try
+            {
+                var type = settings.GetType();
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                var props = type.GetProperties(flags);
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[Icons] Settings dump for '{name}' ({type.Name}): ");
+                foreach (var p in props)
+                {
+                    try
+                    {
+                        var val = p.GetValue(settings);
+                        sb.Append($"{p.Name}={val}, ");
+                    }
+                    catch { sb.Append($"{p.Name}=ERR, "); }
+                }
+                Log.LogInfo(sb.ToString());
+            }
+            catch { }
+        }
+
+        private static object GetSubObject(object obj, string name)
+        {
+            if (obj == null) return null;
+            try
+            {
+                var f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                var p = obj.GetType().GetProperty(name, f);
+                if (p != null) return p.GetValue(obj);
+                var fl = obj.GetType().GetField(name, f);
+                if (fl != null) return fl.GetValue(obj);
+            }
+            catch { }
+            return null;
         }
 
         // ================================================================
@@ -1182,10 +1526,13 @@ namespace MedEffectsHUD
             if (!_hudVisible || _localPlayer == null || _healthController == null) return;
             InitStyles();
             DrawHUD();
+            DrawNotifications();
         }
 
         private int _lastFontSize;
         private float _lastBgAlpha;
+        private string _lastFontName;
+        private bool _lastUseGameFont;
 
         private Font _dynFont;
 
@@ -1193,15 +1540,30 @@ namespace MedEffectsHUD
         {
             int fs = _fontSize.Value;
             float bgA = _backgroundAlpha.Value;
-            if (_stylesInit && fs == _lastFontSize && Mathf.Approximately(bgA, _lastBgAlpha)) return;
+            string fontName = _fontName.Value;
+            bool useGame = _useGameFont.Value;
+
+            bool fontChanged = fontName != _lastFontName || useGame != _lastUseGameFont;
+            if (_stylesInit && fs == _lastFontSize && Mathf.Approximately(bgA, _lastBgAlpha) && !fontChanged)
+                return;
+
             _stylesInit = true;
             _lastFontSize = fs;
             _lastBgAlpha = bgA;
+            _lastFontName = fontName;
+            _lastUseGameFont = useGame;
 
-            // Use a dynamic OS font so fontSize actually works
-            // (the game's GUI.skin.label may have a bitmap font that ignores fontSize)
-            if (_dynFont == null)
-                _dynFont = Font.CreateDynamicFontFromOSFont("Arial", fs);
+            // Resolve font: game font or custom OS font
+            if (useGame)
+            {
+                // Try to find Bender font loaded by EFT, fall back to GUI.skin default
+                _dynFont = FindGameFont() ?? GUI.skin.font ?? GUI.skin.label.font;
+            }
+            else
+            {
+                if (string.IsNullOrWhiteSpace(fontName)) fontName = "Arial";
+                _dynFont = Font.CreateDynamicFontFromOSFont(fontName, fs);
+            }
 
             var bg = MakeTex(2, 2, new Color(0.03f, 0.03f, 0.08f, bgA));
 
@@ -1247,6 +1609,11 @@ namespace MedEffectsHUD
 
         private void DrawHUD()
         {
+            if (_iconDisplayMode.Value == IconDisplayMode.IconOnly)
+            {
+                DrawHUDIconGrid();
+                return;
+            }
             if (_effectLayout.Value == EffectLayout.Stacked)
                 DrawHUDStacked();
             else
@@ -1259,7 +1626,11 @@ namespace MedEffectsHUD
             float x = _hudX.Value, y = _hudY.Value, w = _hudWidth.Value;
             int fs = _fontSize.Value;
             float spacing = _lineSpacing.Value;
-            float lh = _posStyle.CalcSize(new GUIContent("Wg")).y + spacing;
+            float textH = _posStyle.CalcSize(new GUIContent("Wg")).y;
+            bool wantIcon = _iconDisplayMode.Value == IconDisplayMode.IconAndText;
+            // When icons are shown, each row is wrapped in BeginHorizontal which adds implicit margins (~4px)
+            float rowMargin = wantIcon ? 4f : 0f;
+            float lh = (wantIcon ? Mathf.Max(textH, _iconSize.Value) : textH) + rowMargin + spacing;
             int posN = _positiveEffects.Count, negN = _negativeEffects.Count;
 
             bool showPos = posN > 0;
@@ -1275,7 +1646,8 @@ namespace MedEffectsHUD
             float colH = _showColumnHeaders.Value ? fs + 8 : 0;
             float sepH = (_showTitle.Value || _showColumnHeaders.Value) ? 3 : 0;
             float rowsH = any ? maxR * lh : lh;
-            float boxH = titleH + colH + sepH + rowsH + 20;
+            float autoH = titleH + colH + sepH + rowsH + 30;
+            float boxH = _hudHeight.Value > 0 ? _hudHeight.Value : autoH;
             float colW = twoColumns ? (w - 28) / 2f : (w - 20);
 
             GUILayout.BeginArea(new Rect(x, y, w, boxH), _boxStyle);
@@ -1344,7 +1716,10 @@ namespace MedEffectsHUD
             float x = _hudX.Value, y = _hudY.Value, w = _hudWidth.Value;
             int fs = _fontSize.Value;
             float spacing = _lineSpacing.Value;
-            float lh = _posStyle.CalcSize(new GUIContent("Wg")).y + spacing;
+            float textH = _posStyle.CalcSize(new GUIContent("Wg")).y;
+            bool wantIcon = _iconDisplayMode.Value == IconDisplayMode.IconAndText;
+            float rowMargin = wantIcon ? 4f : 0f;
+            float lh = (wantIcon ? Mathf.Max(textH, _iconSize.Value) : textH) + rowMargin + spacing;
             int posN = _positiveEffects.Count, negN = _negativeEffects.Count;
 
             bool showPos = posN > 0;
@@ -1360,7 +1735,8 @@ namespace MedEffectsHUD
             float negRowsH = showNeg ? negN * lh : 0;
             bool any = showPos || showNeg;
             float emptyH = any ? 0 : lh;
-            float boxH = titleH + posHeaderH + posRowsH + sepH + negHeaderH + negRowsH + emptyH + 20;
+            float autoH = titleH + posHeaderH + posRowsH + sepH + negHeaderH + negRowsH + emptyH + 30;
+            float boxH = _hudHeight.Value > 0 ? _hudHeight.Value : autoH;
             float colW = w - 20;
 
             GUILayout.BeginArea(new Rect(x, y, w, boxH), _boxStyle);
@@ -1420,11 +1796,215 @@ namespace MedEffectsHUD
             GUILayout.EndArea();
         }
 
-        /// <summary>Draw a single effect label with blink support and per-segment colours.</summary>
+        /// <summary>Compact icon-only grid layout: icons arranged in rows with short timer underneath each.
+        /// Respects EffectLayout: Stacked = positive on top, negative below; SideBySide = two columns.</summary>
+        private void DrawHUDIconGrid()
+        {
+            float x = _hudX.Value, y = _hudY.Value, w = _hudWidth.Value;
+            int icoSz = _iconSize.Value;
+            float cellW = icoSz + 4;
+            float cellH = icoSz + 16; // icon + timer text below
+            int posN = _positiveEffects.Count, negN = _negativeEffects.Count;
+
+            if (_hideEmptyColumns.Value && posN == 0 && negN == 0) return;
+
+            bool stacked = _effectLayout.Value == EffectLayout.Stacked;
+
+            // Calculate box height
+            float autoH;
+            if (stacked)
+            {
+                int colsAll = Mathf.Max(1, Mathf.FloorToInt(w / cellW));
+                int posRows = posN > 0 ? Mathf.CeilToInt((float)posN / colsAll) : 0;
+                int negRows = negN > 0 ? Mathf.CeilToInt((float)negN / colsAll) : 0;
+                float sepH = (posN > 0 && negN > 0) ? 8 : 0;
+                autoH = (posRows + negRows) * cellH + sepH + 30;
+            }
+            else
+            {
+                float halfW = (w - 24) / 2f;
+                int colsHalf = Mathf.Max(1, Mathf.FloorToInt(halfW / cellW));
+                int posRows = posN > 0 ? Mathf.CeilToInt((float)posN / colsHalf) : 0;
+                int negRows = negN > 0 ? Mathf.CeilToInt((float)negN / colsHalf) : 0;
+                int maxRows = Mathf.Max(posRows, negRows);
+                autoH = Mathf.Max(1, maxRows) * cellH + 30;
+            }
+            float boxH = _hudHeight.Value > 0 ? _hudHeight.Value : autoH;
+
+            GUILayout.BeginArea(new Rect(x, y, w, boxH), _boxStyle);
+
+            bool blinkVis = IsBlinkVisible();
+
+            if (_notifyTimerStyle == null)
+            {
+                _notifyTimerStyle = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = Mathf.Max(9, icoSz / 3),
+                    alignment = TextAnchor.UpperCenter,
+                    richText = true,
+                    wordWrap = false,
+                    clipping = TextClipping.Clip
+                };
+                _notifyTimerStyle.normal.textColor = Color.white;
+            }
+
+            if (stacked)
+            {
+                // --- Stacked: positive block on top, then separator, then negative block ---
+                int colsAll = Mathf.Max(1, Mathf.FloorToInt(w / cellW));
+                if (posN > 0)
+                    DrawIconGridBlock(_positiveEffects, colsAll, icoSz, cellW, cellH, blinkVis, true);
+                if (posN > 0 && negN > 0)
+                    GUILayout.Space(8);
+                if (negN > 0)
+                    DrawIconGridBlock(_negativeEffects, colsAll, icoSz, cellW, cellH, blinkVis, false);
+            }
+            else
+            {
+                // --- Side-by-side: positive left, negative right ---
+                float halfW = (w - 24) / 2f;
+                int colsHalf = Mathf.Max(1, Mathf.FloorToInt(halfW / cellW));
+                int posRows = posN > 0 ? Mathf.CeilToInt((float)posN / colsHalf) : 0;
+                int negRows = negN > 0 ? Mathf.CeilToInt((float)negN / colsHalf) : 0;
+                int maxRows = Mathf.Max(posRows, negRows);
+
+                GUILayout.BeginHorizontal();
+                // Positive column
+                GUILayout.BeginVertical(GUILayout.Width(halfW));
+                if (posN > 0)
+                    DrawIconGridBlock(_positiveEffects, colsHalf, icoSz, cellW, cellH, blinkVis, true);
+                GUILayout.EndVertical();
+                GUILayout.FlexibleSpace();
+                // Negative column
+                GUILayout.BeginVertical(GUILayout.Width(halfW));
+                if (negN > 0)
+                    DrawIconGridBlock(_negativeEffects, colsHalf, icoSz, cellW, cellH, blinkVis, false);
+                GUILayout.EndVertical();
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.EndArea();
+        }
+
+        /// <summary>Draw a block of icons in a grid for one polarity (positive or negative).</summary>
+        private void DrawIconGridBlock(List<DisplayEffect> effects, int cols, int icoSz,
+            float cellW, float cellH, bool blinkVis, bool isPositive)
+        {
+            int count = effects.Count;
+            int rows = Mathf.CeilToInt((float)count / cols);
+            int idx = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                GUILayout.BeginHorizontal();
+                for (int c = 0; c < cols && idx < count; c++, idx++)
+                {
+                    var de = effects[idx];
+                    bool hide = ShouldBlink(de) && !blinkVis;
+                    float alpha = hide ? 0.15f : 1f;
+                    Texture2D icon = GetIcon(de.EffectId, isPositive, displayName: de.Name);
+
+                    GUILayout.BeginVertical(GUILayout.Width(cellW));
+                    if (icon != null)
+                    {
+                        var prevColor = GUI.color;
+                        GUI.color = new Color(1f, 1f, 1f, alpha);
+                        GUILayout.Label(icon, GUILayout.Width(icoSz), GUILayout.Height(icoSz));
+                        GUI.color = prevColor;
+                    }
+                    else
+                    {
+                        var abbr = AbbreviateName(de.Name);
+                        if (abbr.Length > 4) abbr = abbr.Substring(0, 4);
+                        var fallbackStyle = isPositive ? _posStyle : _negStyle;
+                        GUILayout.Label(abbr, fallbackStyle, GUILayout.Width(icoSz), GUILayout.Height(icoSz));
+                    }
+                    if (de.Time > 0)
+                    {
+                        string tCol = de.Time <= _timeColorThreshold.Value
+                            ? _timeExpiringColor.Value : _timeNormalColor.Value;
+                        string alphaHex = hide ? "26" : "";
+                        string timerText = $"<color={tCol}{alphaHex}>{FmtTimeShort(de.Time)}</color>";
+                        GUILayout.Label(timerText, _notifyTimerStyle, GUILayout.Width(cellW));
+                    }
+                    else
+                    {
+                        GUILayout.Label("", _notifyTimerStyle, GUILayout.Width(cellW), GUILayout.Height(12));
+                    }
+                    GUILayout.EndVertical();
+                }
+                GUILayout.EndHorizontal();
+            }
+        }
+
+        /// <summary>Format time compactly for icon-only grid (e.g. "42s", "3:21").</summary>
+        private string FmtTimeShort(float t)
+        {
+            int sec = Mathf.CeilToInt(t);
+            if (sec < 60) return $"{sec}s";
+            return $"{sec / 60}:{sec % 60:D2}";
+        }
+
+        /// <summary>Draw center-screen notification popups for expiring buffs and new debuffs.</summary>
+        private void DrawNotifications()
+        {
+            float now = Time.unscaledTime;
+            int notifySz = _notifyIconSize.Value;
+            float centerX = Screen.width / 2f - notifySz / 2f;
+            float posY = Screen.height * _notifyPositionY.Value;
+
+            // Draw expiring buff notification
+            if (_notifyExpireEndTime > now && !string.IsNullOrEmpty(_notifyExpireEffectId))
+            {
+                Texture2D icon = GetIcon(_notifyExpireEffectId, true, true);
+                if (icon != null)
+                {
+                    float remaining = _notifyExpireEndTime - now;
+                    float alpha = Mathf.Clamp01(remaining / 0.3f); // fade out in last 0.3s
+                    var prevColor = GUI.color;
+                    GUI.color = new Color(0.3f, 1f, 0.3f, alpha); // green tint for buff
+                    GUI.DrawTexture(new Rect(centerX - notifySz - 8, posY, notifySz, notifySz), icon);
+                    GUI.color = prevColor;
+                }
+            }
+
+            // Draw new debuff notification
+            if (_notifyDebuffEndTime > now && !string.IsNullOrEmpty(_notifyDebuffEffectId))
+            {
+                Texture2D icon = GetIcon(_notifyDebuffEffectId, false, true);
+                if (icon != null)
+                {
+                    float remaining = _notifyDebuffEndTime - now;
+                    float alpha = Mathf.Clamp01(remaining / 0.3f);
+                    var prevColor = GUI.color;
+                    GUI.color = new Color(1f, 0.35f, 0.35f, alpha); // red tint for debuff
+                    GUI.DrawTexture(new Rect(centerX + 8, posY, notifySz, notifySz), icon);
+                    GUI.color = prevColor;
+                }
+            }
+        }
+
+        /// <summary>Draw a single effect label with blink support, optional icon, and per-segment colours.</summary>
         private void DrawEffectLabel(DisplayEffect de, GUIStyle style, float colW, bool blinkVis, bool isPositive)
         {
             bool hide = ShouldBlink(de) && !blinkVis;
-            GUILayout.Label(FmtLine(de, isPositive, hide), style, GUILayout.Width(colW));
+            float alpha = hide ? 0.15f : 1f;
+            bool wantIcon = _iconDisplayMode.Value == IconDisplayMode.IconAndText;
+            Texture2D icon = wantIcon ? GetIcon(de.EffectId, isPositive, displayName: de.Name) : null;
+            if (icon != null)
+            {
+                int icoSz = _iconSize.Value;
+                GUILayout.BeginHorizontal(GUILayout.Width(colW));
+                var prevColor = GUI.color;
+                GUI.color = new Color(1f, 1f, 1f, alpha);
+                GUILayout.Label(icon, GUILayout.Width(icoSz), GUILayout.Height(icoSz));
+                GUI.color = prevColor;
+                GUILayout.Label(FmtLine(de, isPositive, hide), style);
+                GUILayout.EndHorizontal();
+            }
+            else
+            {
+                GUILayout.Label(FmtLine(de, isPositive, hide), style, GUILayout.Width(colW));
+            }
         }
 
         /// <summary>Compare two DisplayEffect by time (ascending). Effects without time go to the bottom.</summary>
@@ -1495,8 +2075,140 @@ namespace MedEffectsHUD
         }
 
         // ================================================================
+        //  ICONS
+        // ================================================================
+
+        /// <summary>Try to load an icon for the given effect ID. Returns null if not found.</summary>
+        /// <param name="isPositive">True for positive/buff, false for negative/debuff.</param>
+        /// <param name="forceLoad">Load even in TextOnly mode (for notifications).</param>
+        private Texture2D GetIcon(string effectId, bool isPositive, bool forceLoad = false, string displayName = null)
+        {
+            if (!forceLoad && _iconDisplayMode.Value == IconDisplayMode.TextOnly) return null;
+            if (string.IsNullOrEmpty(effectId)) return null;
+
+            // Cache key includes polarity so same effectId can have different icons
+            string cacheKey = (isPositive ? "p|" : "n|") + effectId;
+            if (_iconCache.TryGetValue(cacheKey, out var cached)) return cached;
+            if (_iconMissing.Contains(cacheKey)) return null;
+
+            // Try polarity-specific folder first (by effectId, then by displayName),
+            // then fallback to root icons folder (by effectId, then by displayName).
+            string polarityFolder = isPositive ? _iconsPositiveFolder : _iconsNegativeFolder;
+            string foundPath = TryFindIconPath(polarityFolder, effectId);
+            if (foundPath == null && !string.IsNullOrEmpty(displayName) && displayName != effectId)
+                foundPath = TryFindIconPath(polarityFolder, displayName);
+            if (foundPath == null)
+                foundPath = TryFindIconPath(_iconsFolder, effectId);
+            if (foundPath == null && !string.IsNullOrEmpty(displayName) && displayName != effectId)
+                foundPath = TryFindIconPath(_iconsFolder, displayName);
+
+            if (foundPath != null)
+            {
+                var tex = LoadPng(foundPath);
+                if (tex != null)
+                {
+                    _iconCache[cacheKey] = tex;
+                    Log.LogInfo($"[Icons] Loaded '{effectId}' (positive={isPositive}, name='{displayName}') => {foundPath}");
+                    return tex;
+                }
+            }
+
+            _iconMissing.Add(cacheKey);
+            Log.LogWarning($"[Icons] No icon found for effectId='{effectId}' (positive={isPositive}, name='{displayName}'), searched: [{polarityFolder}], [{_iconsFolder}]");
+            return null;
+        }
+
+        /// <summary>Find the path to a PNG icon in a specific folder. Returns null if not found.</summary>
+        private string TryFindIconPath(string folder, string effectId)
+        {
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+                return null;
+
+            // Try exact name, then lowercase
+            string[] candidates = { effectId + ".png", effectId.ToLower() + ".png" };
+            foreach (var name in candidates)
+            {
+                var path = Path.Combine(folder, name);
+                if (File.Exists(path))
+                    return path;
+            }
+
+            // Case-insensitive file search (Windows is case-insensitive but let's be safe)
+            try
+            {
+                foreach (var file in Directory.GetFiles(folder, "*.png"))
+                {
+                    string fname = Path.GetFileNameWithoutExtension(file);
+                    if (string.Equals(fname, effectId, StringComparison.OrdinalIgnoreCase))
+                        return file;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Load a PNG file into a Texture2D.</summary>
+        private static Texture2D LoadPng(string path)
+        {
+            try
+            {
+                byte[] data = File.ReadAllBytes(path);
+                var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (tex.LoadImage(data))
+                {
+                    tex.filterMode = FilterMode.Bilinear;
+                    return tex;
+                }
+                UnityEngine.Object.Destroy(tex);
+            }
+            catch { }
+            return null;
+        }
+
+        // ================================================================
         //  HELPERS
         // ================================================================
+
+        private Font _cachedGameFont;
+        private bool _gameFontSearched;
+
+        /// <summary>Find the Bender font used by EFT's UI via Resources.</summary>
+        private Font FindGameFont()
+        {
+            if (_cachedGameFont != null) return _cachedGameFont;
+            if (_gameFontSearched) return null;
+            _gameFontSearched = true;
+            try
+            {
+                var allFonts = Resources.FindObjectsOfTypeAll<Font>();
+                // Prefer "Bender" (main EFT font), then any font with "Bender" in name
+                foreach (var f in allFonts)
+                {
+                    if (f != null && f.name == "Bender")
+                    {
+                        _cachedGameFont = f;
+                        Log.LogInfo($"[Font] Found game font: {f.name}");
+                        return f;
+                    }
+                }
+                foreach (var f in allFonts)
+                {
+                    if (f != null && f.name.IndexOf("Bender", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        _cachedGameFont = f;
+                        Log.LogInfo($"[Font] Found game font: {f.name}");
+                        return f;
+                    }
+                }
+                // Log all available fonts for debugging
+                var names = new List<string>();
+                foreach (var f in allFonts)
+                    if (f != null) names.Add(f.name);
+                Log.LogInfo($"[Font] Bender not found. Available fonts: [{string.Join(", ", names)}]");
+            }
+            catch (Exception ex) { Log.LogWarning($"[Font] {ex.Message}"); }
+            return null;
+        }
 
         private static void AddDedup(List<DisplayEffect> list, HashSet<string> seen,
                                      DisplayEffect de, string key)
@@ -1841,6 +2553,7 @@ namespace MedEffectsHUD
         internal class DisplayEffect
         {
             public string Name;
+            public string EffectId;
             public float Time;
             public float Strength;
         }
