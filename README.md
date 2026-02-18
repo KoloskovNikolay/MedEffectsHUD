@@ -48,7 +48,7 @@ Works with stimulators, medical items, skill effects, bleedings, fractures, and 
 
 ## Installation
 
-1. Download the latest release archive (`MedEffectsHUD-v1.1.0.zip`).
+1. Download the latest release archive (`MedEffectsHUD-v1.1.3.zip`).
 2. Extract it into your **SPT root folder** (the one with `EscapeFromTarkov.exe`).
    - The DLL goes to `BepInEx/plugins/MedEffectsHUD.dll`
    - Icons go to `BepInEx/plugins/MedEffectsHUD/icons/`
