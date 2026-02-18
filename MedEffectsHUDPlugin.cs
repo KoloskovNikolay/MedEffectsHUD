@@ -26,7 +26,7 @@ namespace MedEffectsHUD
     {
         public const string PluginGuid    = "com.koloskovnick.medeffectshud";
         public const string PluginName    = "MedEffectsHUD";
-        public const string PluginVersion = "1.1.0";
+        public const string PluginVersion = "1.1.1";
 
         internal static ManualLogSource Log;
 
@@ -406,6 +406,7 @@ namespace MedEffectsHUD
         {
             _localPlayer = null; _healthController = null;
             _eventsSubscribed = false; _deepScanDone = false;
+            _stylesInit = false; // force style rebuild on next map load
             _capturedBuffs.Clear();
             _buffToContainer.Clear();
             _containerIds.Clear();
@@ -2458,7 +2459,7 @@ namespace MedEffectsHUD
         {
             var px = new Color[w * h];
             for (int i = 0; i < px.Length; i++) px[i] = c;
-            var tex = new Texture2D(w, h);
+            var tex = new Texture2D(w, h) { hideFlags = HideFlags.DontUnloadUnusedAsset };
             tex.SetPixels(px); tex.Apply(); return tex;
         }
 
