@@ -26,7 +26,7 @@ namespace MedEffectsHUD
     {
         public const string PluginGuid    = "com.koloskovnick.medeffectshud";
         public const string PluginName    = "MedEffectsHUD";
-        public const string PluginVersion = "1.1.2";
+        public const string PluginVersion = "1.1.3";
 
         internal static ManualLogSource Log;
 
